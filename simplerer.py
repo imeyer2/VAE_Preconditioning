@@ -380,18 +380,52 @@ def train(args):
 
     # quick summary
     import pandas as pd
+    import matplotlib.pyplot as plt
     try:
         df = pd.read_csv(csv_path)
         hid  = df["hutch_id"].astype(float).values
         hj   = df["hutch_jac"].astype(float).values
         hv   = df["hutch_vae"].astype(float).values
-        print(f"=== OOD Hutchinson proxy (lower is better) ===")
+        print("=== OOD Hutchinson proxy (lower is better) ===")
         print(f"median Identity: {np.median(hid):.3e}")
         print(f"median Jacobi  : {np.median(hj):.3e}")
         print(f"median VAE     : {np.median(hv):.3e}")
         wins = (hv <= hj).sum()
         print(f"VAE beats-or-ties Jacobi on {wins}/{len(hv)} samples")
         print(f"CSV: {csv_path}")
+
+        # --- Visualization 1: Box and whisker plot ---
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.boxplot([hid, hj, hv], labels=["Identity","Jacobi","VAE"], showmeans=True)
+        ax.set_ylabel("Hutchinson proxy (lower=better)")
+        ax.set_title("Distribution across samples")
+        ax.grid(True, axis='y', alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(args.out_dir, f"boxplot_hutch_W{args.W}.png"), dpi=150)
+
+        # --- Visualization 2: Improvement scatter (Jacobi vs VAE) ---
+        fig, ax = plt.subplots(figsize=(5,5))
+        ax.scatter(hj, hv, alpha=0.6)
+        ax.plot([min(hj.min(), hv.min()), max(hj.max(), hv.max())], [min(hj.min(), hv.min()), max(hj.max(), hv.max())], 'r--')
+        ax.set_xlabel("Jacobi proxy")
+        ax.set_ylabel("VAE proxy")
+        ax.set_title("Sample-wise Hutchinson comparison")
+        ax.set_aspect('equal','box')
+        fig.tight_layout()
+        fig.savefig(os.path.join(args.out_dir, f"scatter_jac_vs_vae_W{args.W}.png"), dpi=150)
+
+        # --- Visualization 3: Hint-style histogram of improvements ---
+        improvement = (hj - hv)/hj
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.hist(improvement*100, bins=30, alpha=0.7, color='tab:blue')
+        ax.axvline(0, color='k', linestyle='--')
+        ax.set_xlabel("Percent improvement vs Jacobi (%)")
+        ax.set_ylabel("# samples")
+        ax.set_title("Histogram of VAE gain over Jacobi")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(args.out_dir, f"hist_improvement_W{args.W}.png"), dpi=150)
+        print("[Plot] Saved boxplot, scatter, and histogram to output directory.")
     except Exception as e:
         print(f"[WARN] Could not summarize CSV: {e}")
 

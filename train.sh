@@ -61,7 +61,6 @@ module load cuda/12.4
 #   --data_root data_gen --out_dir runs_min_hutch --W 5 \
 #   --epochs 3 --lr 5e-4 --probes 8
 
-
 python simplerer.py \
-  --data_root data_gen --out_dir runs_min_hutch_v2 --W 5 \
-  --epochs 5 --lr 5e-2 --probes 8
+  --data_root data_gen --out_dir runs_min_hutch --W 5 \
+  --epochs 10 --lr 5e-3 --probes 8
