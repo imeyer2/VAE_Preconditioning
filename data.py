@@ -61,6 +61,73 @@ import psutil, tracemalloc
 # Basic I/O
 # ----------------------------
 
+import warnings
+from scipy.sparse import csr_matrix
+
+def is_close_sym_csr(A: csr_matrix, sym_tol: float = 1e-8):
+    """‖A−Aᵀ‖_max <= sym_tol * max(‖A‖_max, 1)."""
+    if A.shape[0] != A.shape[1]:
+        return False, float("inf")
+    # Work in COO to compare entries against transpose
+    AT = A.transpose().tocsr()
+    # max abs on difference:
+    diff = (A - AT).tocsr()
+    max_abs = 0.0 if A.nnz == 0 else float(np.max(np.abs(A.data)))
+    dmax = 0.0 if diff.nnz == 0 else float(np.max(np.abs(diff.data)))
+    denom = max(max_abs, 1.0)
+    rel = dmax / denom
+    return (rel <= sym_tol), rel
+
+def gershgorin_min_eig(A: csr_matrix):
+    """Conservative lower bound on λmin using Gershgorin disks."""
+    A = A.tocsr()
+    diag = A.diagonal()
+    absA = A.copy()
+    absA.data = np.abs(absA.data)
+    row_sum = np.array(absA.sum(axis=1)).ravel() - np.abs(diag)
+    gmin = float(np.min(diag - row_sum))
+    return gmin
+
+def spd_check_and_fix(
+    A: csr_matrix,
+    sym_tol: float = 1e-8,
+    pd_tol: float = 1e-12,
+    enforce: bool = True,
+    max_shift: float = 1e6
+):
+    """
+    Returns (A_spd, info). If enforce=False and checks fail, A is returned as-is.
+    info: dict with keys {sym_ok, sym_rel_err, gmin, shift, fixed}
+    """
+    info = {"sym_ok": True, "sym_rel_err": 0.0, "gmin": None, "shift": 0.0, "fixed": False}
+
+    # 1) Symmetry check
+    sym_ok, rel = is_close_sym_csr(A, sym_tol=sym_tol)
+    info["sym_ok"] = sym_ok
+    info["sym_rel_err"] = rel
+    if not sym_ok:
+        if enforce:
+            A = ((A + A.T) * 0.5).tocsr()
+            info["fixed"] = True
+        else:
+            return A, info
+
+    # 2) Positive-definite check via Gershgorin
+    gmin = gershgorin_min_eig(A)
+    info["gmin"] = gmin
+    if gmin < pd_tol:
+        if enforce:
+            shift = min((pd_tol - gmin) + 1e-15, max_shift)
+            n = A.shape[0]
+            A = (A + shift * csr_matrix((np.ones(n), (np.arange(n), np.arange(n))), shape=A.shape)).tocsr()
+            info["shift"] = float(shift)
+            info["fixed"] = True
+        # else: leave as-is
+
+    return A, info
+
+
+
 # --- add near the other save/load helpers ---
 class ShardWriter:
     def __init__(self, out_folder: str, shard_size: int):
@@ -406,6 +473,15 @@ def main():
     ap.add_argument("--train_n", type=int, default=100)
     ap.add_argument("--test_n", type=int, default=50)
     ap.add_argument("--shard_size", type=int, default=1000)
+    ap.add_argument("--spd_check", action="store_true", default=True, help="Check SPD before saving.")
+    ap.add_argument("--spd_enforce", action="store_true", default=True, help="Symmetrize and minimally shift to enforce SPD if needed.")
+    ap.add_argument("--spd_sym_tol", type=float, default=1e-8, help="Relative symmetry tolerance.")
+    ap.add_argument("--spd_pd_tol",  type=float, default=1e-12, help="Target minimal eigenvalue after enforcement.")
+    ap.add_argument("--spd_max_shift", type=float, default=1e6, help="Safety cap on diagonal shift if enforcing.")
+    ap.add_argument("--spd_warn_only", action="store_true", help="If check fails and not enforcing, just warn (do not drop).")
+
+
+
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--axis_ood", type=str, default="coeff",
                     choices=["coeff", "anisotropy", "geom", "bc", "res", "rhs"])
@@ -437,6 +513,45 @@ def main():
     for k in pbar:
         cfg = sample_axes(rng, which_axis_ood=args.axis_ood, phase="train")
         A, f, meta = realize_sample(rng, cfg)
+        # After A,f,meta are created, right before pack/save:
+        if args.spd_check or args.spd_enforce:
+            A_checked, info = spd_check_and_fix(
+                A,
+                sym_tol=args.spd_sym_tol,
+                pd_tol=args.spd_pd_tol,
+                enforce=args.spd_enforce,
+                max_shift=args.spd_max_shift,
+            )
+            if (not info["sym_ok"] or info["gmin"] is not None and info["gmin"] < args.spd_pd_tol):
+                def _fmt(x):
+                    if x is None:
+                        return 'None'
+                    if isinstance(x, float):
+                        return f"{x:.3e}"
+                    return str(x)
+                msg = (f"[SPD] sym_ok={info['sym_ok']} rel_sym={info['sym_rel_err']:.2e} "
+                    f"gmin={_fmt(info['gmin'])} shift={_fmt(info['shift'])} fixed={_fmt(info['fixed'])}")
+                if args.spd_enforce:
+                    # Proceed with repaired A
+                    A = A_checked
+                    meta = dict(meta, spd_sym_ok=bool(info["sym_ok"]), spd_sym_rel=float(info["sym_rel_err"]),
+                                spd_gmin=float(info["gmin"]), spd_shift=float(info["shift"]), spd_fixed=True)
+                    print(msg)
+                else:
+                    # Not enforcing: warn and either keep or drop
+                    warnings.warn(msg)
+                    if not args.spd_warn_only:
+                        # Drop this sample and try a replacement
+                        continue
+                    else:
+                        meta = dict(meta, spd_sym_ok=bool(info["sym_ok"]), spd_sym_rel=float(info["sym_rel_err"]),
+                                    spd_gmin=float(info["gmin"]), spd_shift=0.0, spd_fixed=False)
+            else:
+                meta = dict(meta, spd_sym_ok=True, spd_sym_rel=float(info["sym_rel_err"]),
+                            spd_gmin=float(info["gmin"]), spd_shift=0.0, spd_fixed=False)
+
+
+
         packed = pack_sample(A, f, meta, a_float32=args.a_float32, f_float32=args.f_float32)
         train_sw.add(packed)
 
@@ -456,6 +571,39 @@ def main():
     for k in pbar:
         cfg = sample_axes(rng, which_axis_ood=args.axis_ood, phase="ood_test")
         A, f, meta = realize_sample(rng, cfg)
+
+        # >>> SPD check/enforce for OOD too <<<
+        if args.spd_check or args.spd_enforce:
+            A_checked, info = spd_check_and_fix(
+                A,
+                sym_tol=args.spd_sym_tol,
+                pd_tol=args.spd_pd_tol,
+                enforce=args.spd_enforce,
+                max_shift=args.spd_max_shift,
+            )
+            if (not info["sym_ok"] or (info["gmin"] is not None and info["gmin"] < args.spd_pd_tol)):
+                def _fmt(x):
+                    if x is None: return "None"
+                    if isinstance(x, float): return f"{x:.3e}"
+                    return str(x)
+                msg = (f"[SPD] (OOD) sym_ok={info['sym_ok']} rel_sym={info['sym_rel_err']:.2e} "
+                       f"gmin={_fmt(info['gmin'])} shift={_fmt(info['shift'])} fixed={_fmt(info['fixed'])}")
+                if args.spd_enforce:
+                    A = A_checked
+                    meta = dict(meta, spd_sym_ok=bool(info["sym_ok"]), spd_sym_rel=float(info["sym_rel_err"]),
+                                spd_gmin=float(info["gmin"]), spd_shift=float(info["shift"]), spd_fixed=True)
+                    print(msg)
+                else:
+                    warnings.warn(msg)
+                    if not args.spd_warn_only:
+                        continue
+                    else:
+                        meta = dict(meta, spd_sym_ok=bool(info["sym_ok"]), spd_sym_rel=float(info["sym_rel_err"]),
+                                    spd_gmin=float(info["gmin"]), spd_shift=0.0, spd_fixed=False)
+            else:
+                meta = dict(meta, spd_sym_ok=True, spd_sym_rel=float(info["sym_rel_err"]),
+                            spd_gmin=float(info["gmin"]), spd_shift=0.0, spd_fixed=False)
+
         packed = pack_sample(A, f, meta, a_float32=args.a_float32, f_float32=args.f_float32)
         test_sw.add(packed)
 
@@ -465,6 +613,8 @@ def main():
         if (k % 50) == 0:
             _, peak = tracemalloc.get_traced_memory()
             pbar.set_postfix(rss=f"{rss_gb():.2f}GB", peak=f"{peak/1024/1024/1024:.2f}GB")
+
+
     test_shards = test_sw.close()
 
     print(

@@ -41,11 +41,13 @@ def load_shard(path: str):
     return torch.load(path, map_location="cpu")  # list of dicts
 
 def payload_to_csr(d):
-    crow = d["A_crow_indices"].cpu().numpy()
-    col  = d["A_col_indices"].cpu().numpy()
-    val  = d["A_values"].cpu().numpy()
-    n0, n1 = d["A_shape"]
-    return csr_matrix((val, col, crow), shape=(n0, n1))
+    crow = d["A_crow_indices"].cpu().numpy().astype(np.int64, copy=False)
+    col  = d["A_col_indices"].cpu().numpy().astype(np.int64, copy=False)
+    # force float64 for robust eigensolvers
+    val  = d["A_values"].cpu().numpy().astype(np.float64, copy=False)
+    n0, n1 = map(int, d["A_shape"])
+    return csr_matrix((val, col, crow), shape=(n0, n1), dtype=np.float64)
+
 
 def build_band_from_csr(A_csr: csr_matrix, S: int, W: int, dtype=np.float32):
     n = S*S
@@ -329,32 +331,92 @@ def vae_precond_objective_with_ratio(
 # Cond number + PCG utils
 # =======================
 
-def cond_estimate(A: csr_matrix, maxiter_eigs=100):
+def _eig_extremes(A_csr: csr_matrix, maxiter_eigs=300, tol=1e-6):
+    """Return (lmin, lmax) using ARPACK; fallback to Gershgorin on failure."""
     try:
-        lmax = eigsh(A, k=1, which='LM', return_eigenvectors=False, maxiter=maxiter_eigs)[0]
-        lmin = eigsh(A, k=1, which='SM', return_eigenvectors=False, maxiter=maxiter_eigs)[0]
-        if lmax <= 0 or lmin <= 0: return np.nan
-        return float(lmax / lmin)
+        # largest (easy & stable)
+        lmax = eigsh(A_csr, k=1, which='LM', return_eigenvectors=False, maxiter=maxiter_eigs, tol=tol)[0]
     except Exception:
-        return np.nan
+        lmax = np.nan
+    try:
+        # smallest algebraic (no shift-invert)
+        lmin = eigsh(A_csr, k=1, which='SA', return_eigenvectors=False, maxiter=maxiter_eigs, tol=tol)[0]
+    except Exception:
+        lmin = np.nan
 
-def cond_estimate_precond(A: csr_matrix, D: np.ndarray, maxiter_eigs=100):
-    n = A.shape[0]
-    Ds = np.sqrt(np.maximum(D, 1e-30))
-    invDs = 1.0 / Ds
-    def mv(x):
-        y = x * invDs
-        y = A @ y
-        y = y * invDs
-        return y
-    Lop = LinearOperator((n, n), matvec=mv, dtype=A.dtype)
-    try:
-        lmax = eigsh(Lop, k=1, which='LM', return_eigenvectors=False, maxiter=maxiter_eigs)[0]
-        lmin = eigsh(Lop, k=1, which='SM', return_eigenvectors=False, maxiter=maxiter_eigs)[0]
-        if lmax <= 0 or lmin <= 0: return np.nan
-        return float(lmax / lmin)
-    except Exception:
+    if not (np.isfinite(lmin) and np.isfinite(lmax) and lmin > 0 and lmax > 0):
+        # Gershgorin fallback (safe, conservative)
+        A = A_csr
+        diag = A.diagonal()
+        absA = A.copy()
+        absA.data = np.abs(absA.data)
+        row_sums = np.array(absA.sum(axis=1)).ravel() - np.abs(diag)
+        gmin = np.min(diag - row_sums)
+        gmax = np.max(diag + row_sums)
+        lmin = gmin if (not np.isfinite(lmin) or lmin <= 0) else lmin
+        lmax = gmax if (not np.isfinite(lmax) or lmax <= 0) else lmax
+
+    return float(lmin), float(lmax)
+
+def cond_estimate(A: csr_matrix, maxiter_eigs=300):
+    """κ(A) via ARPACK with Gershgorin fallback. Expects SPD."""
+    A = A.astype(np.float64, copy=False)
+    lmin, lmax = _eig_extremes(A, maxiter_eigs=maxiter_eigs)
+    if lmin <= 0 or not np.isfinite(lmin) or not np.isfinite(lmax):
         return np.nan
+    return float(lmax / lmin)
+
+def _scaled_B_from_diag(A: csr_matrix, D: np.ndarray) -> csr_matrix:
+    """
+    Build B = D^{-1/2} A D^{-1/2} explicitly as CSR (float64) for robust eigs.
+    D is the diagonal entries for the preconditioner (strictly > 0).
+    """
+    A = A.astype(np.float64, copy=False)
+    n = A.shape[0]
+    Ds_inv = 1.0 / np.sqrt(np.clip(D.astype(np.float64, copy=False), 1e-30, 1e12))
+    # Scale rows, then scale data by column factor
+    data = A.data.copy()
+    indptr = A.indptr
+    indices = A.indices
+    for i in range(n):
+        row_start, row_end = indptr[i], indptr[i+1]
+        if row_end > row_start:
+            data[row_start:row_end] *= Ds_inv[i]
+            cols = indices[row_start:row_end]
+            data[row_start:row_end] *= Ds_inv[cols]
+    return csr_matrix((data, indices.copy(), indptr.copy()), shape=A.shape, dtype=np.float64)
+
+def cond_estimate_precond(A: csr_matrix, D: np.ndarray, maxiter_eigs=300):
+    """
+    κ(M^{-1/2} A M^{-1/2}) computed on an explicit scaled CSR to avoid
+    LinearOperator + shift-invert pitfalls.
+    """
+    # Safety clamp D and cast to f64
+    D = np.clip(D.astype(np.float64, copy=False), 1e-30, 1e12)
+    B = _scaled_B_from_diag(A, D)
+    lmin, lmax = _eig_extremes(B, maxiter_eigs=maxiter_eigs)
+    if lmin <= 0 or not np.isfinite(lmin) or not np.isfinite(lmax):
+        return np.nan
+    return float(lmax / lmin)
+
+
+def kappa_from_fixedstep_relres(rel, k=5, cap=1e12):
+    """Upper-bound-ish κ from fixed-step CG/PCG relative residual.
+    Falls back to 'cap' if the math would explode."""
+    try:
+        rel = float(rel)
+    except Exception:
+        return cap
+    if not np.isfinite(rel) or rel <= 0:
+        return cap
+    r = rel ** (1.0 / max(1, k))
+    if r >= 1.0:  # no reduction → huge κ
+        return cap
+    kappa = ((1.0 + r) / (1.0 - r)) ** 2
+    if not np.isfinite(kappa) or kappa <= 0:
+        return cap
+    return float(min(kappa, cap))
+
 
 def pcg_5step_reduction(A: csr_matrix, b: np.ndarray, D: np.ndarray, steps: int = 5, tol_fallback=1e-32):
     """
@@ -362,14 +424,14 @@ def pcg_5step_reduction(A: csr_matrix, b: np.ndarray, D: np.ndarray, steps: int 
     Returns: rel_resid = ||r_k|| / ||r_0||  (k = steps), NaN-safe and warning-free.
     """
     n = A.shape[0]
-    D = np.clip(D, 1e-20, 1e12)
+    D = np.clip(D, 1e-20, 1e12).astype(np.float64, copy=False)
     invD = 1.0 / D
 
     def matvec(x):
         return A @ x
 
-    x = np.zeros(n, dtype=A.dtype)
-    r = b - matvec(x)
+    x = np.zeros(n, dtype=np.float64)
+    r = b.astype(np.float64, copy=False) - matvec(x)
     z = invD * r
     p = z.copy()
 
@@ -456,7 +518,8 @@ def train(args):
             dA = batch["Acsr"]
             crow = torch.from_numpy(dA.indptr.astype(np.int64)).to(device)
             col  = torch.from_numpy(dA.indices.astype(np.int64)).to(device)
-            val  = torch.from_numpy(dA.data / scale).to(device=device, dtype=dtype)
+            # val  = torch.from_numpy(dA.data / scale).to(device=device, dtype=dtype)
+            val  = torch.from_numpy(dA.data).to(device=device, dtype=dtype)
             L = dA.shape[0]
             A_t = torch.sparse_csr_tensor(crow, col, val, size=(L, L), dtype=dtype, device=device)
             A_sp = A_t  # CSR works well in torch
@@ -467,9 +530,12 @@ def train(args):
 
             # Objective
             beta_now = beta_schedule(step, args.kl_warmup_steps, cycle=args.kl_cycle)
+            # loss, parts = vae_precond_objective_with_ratio(
+            #     m_diag, mu, lv, A_sparse=A_sp, X_band=X, scale=scale,
+            m_for_loss = m_diag.clamp(min=torch.as_tensor(1e-20, dtype=dtype, device=device),
+                                                max=torch.as_tensor(1e12,  dtype=dtype, device=device))
             loss, parts = vae_precond_objective_with_ratio(
-                m_diag, mu, lv, A_sparse=A_sp, X_band=X, scale=scale,
-                probes=args.probes,
+                m_for_loss, mu, lv, A_sparse=A_sp, X_band=X, scale=scale,
                 w_residual=args.w_residual,
                 w_spectral=args.w_spectral,
                 mean1_weight=args.mean1_weight,
@@ -495,11 +561,27 @@ def train(args):
             if (step % 100) == 0:
                 mmin = float(m_diag.min().detach().cpu())
                 mmax = float(m_diag.max().detach().cpu())
+                # pbar.set_postfix(loss=f"{loss.item():.4f}",
+                #                  pre=f"{parts.get('pre', 0.0):.3f}",
+                #                  spec=f"{parts.get('spec', 0.0):.3f}",
+                #                  kl=f"{parts.get('kl', 0.0):.3f}",
+                #                  mmin=f"{mmin:.2e}", mmax=f"{mmax:.2e}")
+
+                # extra sanity: compare m vs diag(A)
+                with torch.no_grad():
+                    a_diag_unscaled = (a_diag_scaled * scale).squeeze(0).detach().cpu().numpy()
+                    m_np = m_diag.squeeze(0).detach().cpu().numpy()
+                    ratio = np.clip(m_np / np.clip(a_diag_unscaled, 1e-30, 1e30), 1e-30, 1e30)
+                    rmin, rmax = args.ratio_rmin, args.ratio_rmax
+                    frac_oob = float(((ratio < rmin) | (ratio > rmax)).mean())
                 pbar.set_postfix(loss=f"{loss.item():.4f}",
-                                 pre=f"{parts.get('pre', 0.0):.3f}",
-                                 spec=f"{parts.get('spec', 0.0):.3f}",
-                                 kl=f"{parts.get('kl', 0.0):.3f}",
-                                 mmin=f"{mmin:.2e}", mmax=f"{mmax:.2e}")
+                                pre=f"{parts.get('pre', 0.0):.3f}",
+                                spec=f"{parts.get('spec', 0.0):.3f}",
+                                kl=f"{parts.get('kl', 0.0):.3f}",
+                                mmin=f"{mmin:.2e}", mmax=f"{mmax:.2e}",
+                                oob=f"{frac_oob:.2%}")
+
+
             else:
                 pbar.set_postfix(loss=f"{loss.item():.4f}",
                                  pre=f"{parts.get('pre', 0.0):.3f}",
@@ -535,6 +617,8 @@ def train(args):
         writer.writerow([
             "index","S","W",
             "cond_A","cond_Mjac_A","cond_Mvae_A",
+            "rel_resid_5_id",
+
             "rel_resid_5_jacobi","rel_resid_5_vae"
         ])
 
@@ -553,31 +637,46 @@ def train(args):
                 a_diag_np = (a_diag_scaled_eval * scale).squeeze(0).cpu().numpy()
                 m_diag = (a_diag_np * F.softplus(s_mu).squeeze(0).cpu().numpy()) + model.eps
 
-            # Safety clamps (eval-only) to avoid NaNs/Inf in fixed PCG
+            # Preconditioner diagonals (clamped)
             D_vae = np.nan_to_num(m_diag, nan=1.0, posinf=1e12, neginf=1e-12)
             D_vae = np.clip(D_vae, 1e-20, 1e12)
             D_jac = np.clip(Acsr.diagonal().copy(), 1e-20, 1e12)
+            D_eye = np.ones(Acsr.shape[0], dtype=np.float64)
 
-            # Condition numbers (robust to failure)
-            condA    = cond_estimate(Acsr, maxiter_eigs=args.eigs_maxiter)
-            condJacA = cond_estimate_precond(Acsr, D_jac, maxiter_eigs=args.eigs_maxiter)
-            condVaeA = cond_estimate_precond(Acsr, D_vae, maxiter_eigs=args.eigs_maxiter)
-
-            # Random unit rhs
+            # Random unit rhs (fixed seed for reproducibility)
             rng = np.random.default_rng(1234)
-            b = rng.normal(0,1, size=Acsr.shape[0]); b /= (np.linalg.norm(b) + 1e-12)
+            b = rng.normal(0, 1, size=Acsr.shape[0])
+            b /= (np.linalg.norm(b) + 1e-12)
 
+            # 5-step reductions for all three systems
+            rel5_A   = pcg_5step_reduction(Acsr, b, D_eye, steps=5)
             rel5_jac = pcg_5step_reduction(Acsr, b, D_jac, steps=5)
             rel5_vae = pcg_5step_reduction(Acsr, b, D_vae, steps=5)
 
+            # Try eigens; if they fail, substitute the fixed-step estimate
+            condA    = cond_estimate(Acsr, maxiter_eigs=args.eigs_maxiter)
+            if not (np.isfinite(condA) and condA > 0.0):
+                condA = kappa_from_fixedstep_relres(rel5_A, k=5)
+
+            condJacA = cond_estimate_precond(Acsr, D_jac, maxiter_eigs=args.eigs_maxiter)
+            if not (np.isfinite(condJacA) and condJacA > 0.0):
+                condJacA = kappa_from_fixedstep_relres(rel5_jac, k=5)
+
+            condVaeA = cond_estimate_precond(Acsr, D_vae, maxiter_eigs=args.eigs_maxiter)
+            if not (np.isfinite(condVaeA) and condVaeA > 0.0):
+                condVaeA = kappa_from_fixedstep_relres(rel5_vae, k=5)
+
             writer.writerow([
                 idx, S, args.W,
-                f"{condA:.6e}" if not np.isnan(condA) else "nan",
-                f"{condJacA:.6e}" if not np.isnan(condJacA) else "nan",
-                f"{condVaeA:.6e}" if not np.isnan(condVaeA) else "nan",
-                f"{rel5_jac:.6e}", f"{rel5_vae:.6e}"
+                f"{condA:.6e}",
+                f"{condJacA:.6e}",
+                f"{condVaeA:.6e}",
+                f"{rel5_A:.6e}",
+                f"{rel5_jac:.6e}",
+                f"{rel5_vae:.6e}"
             ])
             idx += 1
+
 
     print(f"[CSV] OOD evaluation saved to {csv_path}")
 
@@ -585,16 +684,78 @@ def train(args):
     df_eval = pd.read_csv(csv_path)
     if len(df_eval):
         fig2, ax2 = plt.subplots(figsize=(6,4))
+        # jac = np.log10(np.maximum(df_eval["rel_resid_5_jacobi"].values, 1e-16))
+        # vae = np.log10(np.maximum(df_eval["rel_resid_5_vae"].values, 1e-16))
+        # ax2.boxplot([jac, vae], labels=["Jacobi", "VAE-Jacobi"])
+        # ax2.set_ylabel("log10 residual after 5 PCG steps")
+        # ax2.set_title(f"OOD: 5-step PCG residual reduction (W={args.W})")
+        # Three-way comparison: Identity (no precond), Jacobi, VAE-Jacobi
+        idd = np.log10(np.maximum(df_eval["rel_resid_5_id"].values, 1e-16))
         jac = np.log10(np.maximum(df_eval["rel_resid_5_jacobi"].values, 1e-16))
         vae = np.log10(np.maximum(df_eval["rel_resid_5_vae"].values, 1e-16))
-        ax2.boxplot([jac, vae], labels=["Jacobi", "VAE-Jacobi"])
+        ax2.boxplot([idd, jac, vae], labels=["Identity", "Jacobi", "VAE-Jacobi"])
         ax2.set_ylabel("log10 residual after 5 PCG steps")
         ax2.set_title(f"OOD: 5-step PCG residual reduction (W={args.W})")
+
         ax2.grid(True, axis="y", alpha=0.3)
         fig2.tight_layout()
         fig2_path = os.path.join(args.out_dir, f"ood_pcg5_box_W{args.W}.png")
         fig2.savefig(fig2_path, dpi=150)
         print(f"[Plot] Saved {fig2_path}")
+
+    
+    # ================= Cond-number histograms =================
+    df_eval = pd.read_csv(csv_path)
+    if len(df_eval):
+        # Parse safely (ignore nans)
+        def _to_num(x):
+            try:
+                return float(x)
+            except Exception:
+                return np.nan
+
+        c_jac = np.array([_to_num(v) for v in df_eval["cond_Mjac_A"].values], dtype=np.float64)
+        c_vae = np.array([_to_num(v) for v in df_eval["cond_Mvae_A"].values], dtype=np.float64)
+
+        c_jac = c_jac[np.isfinite(c_jac) & (c_jac > 0)]
+        c_vae = c_vae[np.isfinite(c_vae) & (c_vae > 0)]
+
+        if c_jac.size > 0 and c_vae.size > 0:
+            # Log10 histograms side-by-side for readability
+            fig3, (axL, axR) = plt.subplots(1, 2, figsize=(10,4), sharey=True)
+            axL.hist(np.log10(c_jac), bins=40, alpha=0.9)
+            axL.set_title("Jacobi precond κ(B)")
+            axL.set_xlabel("log10 κ")
+            axL.set_ylabel("count")
+            axL.grid(True, axis="y", alpha=0.3)
+
+            axR.hist(np.log10(c_vae), bins=40, alpha=0.9)
+            axR.set_title("VAE-Jacobi precond κ(B)")
+            axR.set_xlabel("log10 κ")
+            axR.grid(True, axis="y", alpha=0.3)
+
+            fig3.suptitle(f"Condition numbers of B = M^(-1/2) A M^(-1/2) (W={args.W})")
+            fig3.tight_layout()
+            fig3_path = os.path.join(args.out_dir, f"ood_cond_hist_W{args.W}.png")
+            fig3.savefig(fig3_path, dpi=150)
+            print(f"[Plot] Saved {fig3_path}")
+
+            # Optional: overlaid comparison
+            fig4, ax4 = plt.subplots(figsize=(6,4))
+            ax4.hist(np.log10(c_jac), bins=40, alpha=0.5, label="Jacobi")
+            ax4.hist(np.log10(c_vae), bins=40, alpha=0.5, label="VAE-Jacobi")
+            ax4.set_xlabel("log10 κ")
+            ax4.set_ylabel("count")
+            ax4.set_title(f"κ(B) comparison (W={args.W})")
+            ax4.legend()
+            ax4.grid(True, axis="y", alpha=0.3)
+            fig4.tight_layout()
+            fig4_path = os.path.join(args.out_dir, f"ood_cond_hist_overlay_W{args.W}.png")
+            fig4.savefig(fig4_path, dpi=150)
+            print(f"[Plot] Saved {fig4_path}")
+        else:
+            print("[Warn] Not enough finite condition numbers to plot histograms.")
+
 
     print("[Done] Training + OOD evaluation complete.")
 
