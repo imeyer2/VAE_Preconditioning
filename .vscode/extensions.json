@@ -1,0 +1,5 @@
+{
+    "unwantedRecommendations": [
+        "ms-python.vscode-python-envs"
+    ]
+}
